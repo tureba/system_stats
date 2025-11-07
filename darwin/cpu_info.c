@@ -97,9 +97,9 @@ void ReadCPUInformation(Tuplestorestate *tupstore, TupleDesc tupdesc)
 	if (sysctlbyname("hw.machine", machine, &char_size, 0, 0) == -1)
 		nulls[Anum_architecture] = true;
 
-	sprintf(s_byte_order, "%d", byte_order);
-	sprintf(s_cpu_family, "%d", cpu_family);
-	sprintf(s_cpu_type, "%d", cpu_type);
+	snprintf(s_byte_order, MAXPGPATH, "%d", byte_order);
+	snprintf(s_cpu_family, MAXPGPATH, "%d", cpu_family);
+	snprintf(s_cpu_type, MAXPGPATH, "%d", cpu_type);
 
 	nulls[Anum_cpu_vendor] = true;
 	nulls[Anum_cpu_description] = true;
@@ -111,7 +111,7 @@ void ReadCPUInformation(Tuplestorestate *tupstore, TupleDesc tupdesc)
 	values[Anum_cpu_type] = CStringGetTextDatum(s_cpu_type);
 	values[Anum_logical_processor] = Int32GetDatum(logical_cpu);
 	values[Anum_physical_processor] = Int32GetDatum(physical_cpu);
-	values[Anum_cpu_clock_speed] = Int64GetDatumFast(cpu_frequency);
+	values[Anum_cpu_clock_speed] = UInt64GetDatum(cpu_frequency);
 	values[Anum_l1dcache_size] = Int32GetDatum((int)(l1d_cache_bytes/1024));
 	values[Anum_l1icache_size] = Int32GetDatum((int)(l1i_cache_bytes/1024));
 	values[Anum_l2cache_size] = Int32GetDatum((int)(l2_cache_bytes/1024));

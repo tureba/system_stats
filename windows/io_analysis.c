@@ -12,6 +12,7 @@
 
 #include <windows.h>
 #include <wbemidl.h>
+#include <winioctl.h>
 
 #define MAX_DRIVE_COUNT  32
 #define MAX_DEVICE_PATH  1024
@@ -37,7 +38,7 @@ void ReadIOAnalysisInformation(Tuplestorestate *tupstore, TupleDesc tupdesc)
 
 	for (deviceId = 0; deviceId <= MAX_DRIVE_COUNT; ++deviceId)
 	{
-		sprintf_s(szDevice, MAX_DEVICE_PATH, "\\\\.\\PhysicalDrive%d", deviceId);
+		snprintf(szDevice, MAX_DEVICE_PATH, "\\\\.\\PhysicalDrive%d", deviceId);
 
 		hDevice = CreateFile(szDevice, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
 			NULL, OPEN_EXISTING, 0, NULL);
@@ -86,15 +87,15 @@ void ReadIOAnalysisInformation(Tuplestorestate *tupstore, TupleDesc tupdesc)
 			return;
 		}
 
-		sprintf_s(szDeviceDisplay, MAX_DEVICE_PATH, "PhysicalDrive%i", deviceId);
+		snprintf(szDeviceDisplay, MAX_DEVICE_PATH, "PhysicalDrive%i", deviceId);
 
 		values[Anum_device_name] = CStringGetTextDatum(szDeviceDisplay);
-		values[Anum_total_read] = Int64GetDatumFast((uint64)diskPerformance.ReadCount);
-		values[Anum_total_write] = Int64GetDatumFast((uint64)diskPerformance.WriteCount);
-		values[Anum_read_bytes] = Int64GetDatumFast((uint64)(diskPerformance.BytesRead.QuadPart));
-		values[Anum_write_bytes] = Int64GetDatumFast((uint64)(diskPerformance.BytesWritten.QuadPart));
-		values[Anum_read_time_ms] = Int64GetDatumFast((uint64)(diskPerformance.ReadTime.QuadPart) / 10000000);
-		values[Anum_write_time_ms] = Int64GetDatumFast((uint64)(diskPerformance.WriteTime.QuadPart) / 10000000);
+		values[Anum_total_read] = UInt64GetDatum((uint64)diskPerformance.ReadCount);
+		values[Anum_total_write] = UInt64GetDatum((uint64)diskPerformance.WriteCount);
+		values[Anum_read_bytes] = UInt64GetDatum((uint64)(diskPerformance.BytesRead.QuadPart));
+		values[Anum_write_bytes] = UInt64GetDatum((uint64)(diskPerformance.BytesWritten.QuadPart));
+		values[Anum_read_time_ms] = UInt64GetDatum((uint64)(diskPerformance.ReadTime.QuadPart) / 10000000);
+		values[Anum_write_time_ms] = UInt64GetDatum((uint64)(diskPerformance.WriteTime.QuadPart) / 10000000);
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 

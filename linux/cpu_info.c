@@ -195,7 +195,7 @@ void ReadCPUInformation(Tuplestorestate *tupstore, TupleDesc tupdesc)
 
 		if (physical_processor)
 		{
-			sprintf(cpu_desc, "%s model %s family %s", vendor_id, model, cpu_family);
+			snprintf(cpu_desc, MAXPGPATH, "%s model %s family %s", vendor_id, model, cpu_family);
 			/* convert CPU frequency from MHz to Hz */
 			cpu_hz = atof(cpu_mhz);
 			cpu_freq = (cpu_hz * 1000000);
@@ -207,7 +207,7 @@ void ReadCPUInformation(Tuplestorestate *tupstore, TupleDesc tupdesc)
 			values[Anum_physical_processor] = Int32GetDatum(physical_processor);
 			values[Anum_no_of_cores] = Int32GetDatum(cpu_cores);
 			values[Anum_architecture] = CStringGetTextDatum(architecture);
-			values[Anum_cpu_clock_speed] = Int64GetDatumFast(cpu_freq);
+			values[Anum_cpu_clock_speed] = UInt64GetDatum(cpu_freq);
 			values[Anum_l1dcache_size] = Int32GetDatum(l1dcache_size_kb);
 			values[Anum_l1icache_size] = Int32GetDatum(l1icache_size_kb);
 			values[Anum_l2cache_size] = Int32GetDatum(l2cache_size_kb);

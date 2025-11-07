@@ -197,7 +197,7 @@ uint64 ReadTotalCPUUsage()
 void ReadCPUMemoryUsage(int sample)
 {
 	FILE *fpstat;
-	struct dirent *ent, dbuf;
+	struct dirent *ent;
 	char  file_name[MAXPGPATH];
 	long utime_ticks, stime_ticks;
 	char process_name[MAXPGPATH] = {0};
@@ -227,7 +227,7 @@ void ReadCPUMemoryUsage(int sample)
 		return;
 	}
 
-	while (readdir_r(dirp, &dbuf, &ent) == 0)
+	while ((ent = readdir(dirp)) != NULL)
 	{
 		memset(file_name, 0x00, MAXPGPATH);
 
@@ -237,7 +237,7 @@ void ReadCPUMemoryUsage(int sample)
 		if (!isdigit(*ent->d_name))
 			continue;
 
-		sprintf(file_name,"/proc/%s/stat", ent->d_name);
+		snprintf(file_name, MAXPGPATH, "/proc/%s/stat", ent->d_name);
 
 		fpstat = fopen(file_name, "r");
 		if (fpstat == NULL)
@@ -347,8 +347,8 @@ void ReadCPUMemoryByProcess(Tuplestorestate *tupstore, TupleDesc tupdesc)
 		values[Anum_process_name] = CStringGetTextDatum(command);
 		values[Anum_percent_cpu_usage] = Float4GetDatum(cpu_usage);
 		values[Anum_percent_memory_usage] = Float4GetDatum(memory_usage);
-		values[Anum_process_memory_bytes] = Int64GetDatumFast((uint64)rss_memory);
-		values[Anum_process_running_since] = Int64GetDatumFast((uint64)(running_since));
+		values[Anum_process_memory_bytes] = UInt64GetDatum((uint64)rss_memory);
+		values[Anum_process_running_since] = UInt64GetDatum((uint64)(running_since));
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 
