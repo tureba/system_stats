@@ -11,10 +11,20 @@
 #include "system_stats.h"
 
 #include <windows.h>
-#include <wbemidl.h>
 #include <psapi.h>
+#include <winternl.h>
 
 #pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "ntdll.lib")
+
+/* Function pointer type for RtlGetVersion */
+typedef NTSTATUS (WINAPI *RtlGetVersionFunc)(PRTL_OSVERSIONINFOW);
+
+/* Helper function to get OS friendly name from registry */
+static bool get_os_friendly_name(char *buffer, size_t bufsize);
+
+/* Helper function to convert FILETIME to readable string */
+static void format_boot_time(ULONGLONG uptimeMs, char *buffer, size_t bufsize);
 
 /* Static cache for OS information that doesn't change during runtime */
 typedef struct {
@@ -32,6 +42,89 @@ typedef struct {
 } OSInfoCache;
 
 static OSInfoCache os_cache = {false};
+
+/* Get OS friendly name from Windows registry */
+static bool get_os_friendly_name(char *buffer, size_t bufsize)
+{
+	HKEY hKey;
+	DWORD dwType = REG_SZ;
+	DWORD dwSize = (DWORD)bufsize;
+	LONG result;
+
+	memset(buffer, 0, bufsize);
+
+	/* Open registry key for Windows version info */
+	result = RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+						   "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+						   0,
+						   KEY_READ,
+						   &hKey);
+
+	if (result != ERROR_SUCCESS)
+	{
+		ereport(DEBUG1, (errmsg("Failed to open registry key for OS name")));
+		return false;
+	}
+
+	/* Try to read ProductName first (most descriptive) */
+	result = RegQueryValueExA(hKey, "ProductName", NULL, &dwType,
+							  (LPBYTE)buffer, &dwSize);
+
+	if (result != ERROR_SUCCESS || dwSize == 0)
+	{
+		/* Fallback to DisplayVersion or ReleaseId */
+		dwSize = (DWORD)bufsize;
+		result = RegQueryValueExA(hKey, "DisplayVersion", NULL, &dwType,
+								  (LPBYTE)buffer, &dwSize);
+	}
+
+	RegCloseKey(hKey);
+
+	return (result == ERROR_SUCCESS && strlen(buffer) > 0);
+}
+
+/* Format boot time as a readable string (WMI format for compatibility) */
+static void format_boot_time(ULONGLONG uptimeMs, char *buffer, size_t bufsize)
+{
+	FILETIME currentFt;
+	ULARGE_INTEGER currentTime, bootTime;
+	SYSTEMTIME bootSt, localSt;
+	TIME_ZONE_INFORMATION tzi;
+
+	/* Get current time as FILETIME */
+	GetSystemTimeAsFileTime(&currentFt);
+
+	currentTime.LowPart = currentFt.dwLowDateTime;
+	currentTime.HighPart = currentFt.dwHighDateTime;
+
+	/* Subtract uptime to get boot time (uptime is in ms, FILETIME is in 100ns intervals) */
+	bootTime.QuadPart = currentTime.QuadPart - (uptimeMs * 10000ULL);
+
+	/* Convert to SYSTEMTIME */
+	currentFt.dwLowDateTime = bootTime.LowPart;
+	currentFt.dwHighDateTime = bootTime.HighPart;
+
+	if (FileTimeToSystemTime(&currentFt, &bootSt))
+	{
+		/* Convert to local time for display */
+		if (GetTimeZoneInformation(&tzi) != TIME_ZONE_ID_INVALID &&
+			SystemTimeToTzSpecificLocalTime(&tzi, &bootSt, &localSt))
+		{
+			/* Format as YYYYMMDDHHmmss.mmmmmm+offset (WMI CIM_DATETIME format) */
+			snprintf(buffer, bufsize, "%04d%02d%02d%02d%02d%02d.000000%+03d0",
+					 localSt.wYear, localSt.wMonth, localSt.wDay,
+					 localSt.wHour, localSt.wMinute, localSt.wSecond,
+					 -(tzi.Bias / 60));
+		}
+		else
+		{
+			/* Fallback to UTC if timezone conversion fails */
+			snprintf(buffer, bufsize, "%04d%02d%02d%02d%02d%02d.000000+000",
+					 bootSt.wYear, bootSt.wMonth, bootSt.wDay,
+					 bootSt.wHour, bootSt.wMinute, bootSt.wSecond);
+		}
+	}
+}
 
 void ReadOSInformations(Tuplestorestate *tupstore, TupleDesc tupdesc)
 {
@@ -65,10 +158,12 @@ void ReadOSInformations(Tuplestorestate *tupstore, TupleDesc tupdesc)
 	/* Check if static OS information is cached */
 	if (!os_cache.initialized)
 	{
-		/* First call - query WMI and populate cache */
-		HRESULT hres = 0;
-		IEnumWbemClassObject *results = NULL;
-		BSTR query = SysAllocString(L"SELECT * FROM Win32_Operatingsystem");
+		/* First call - use native Windows APIs to populate cache (fast, no WMI overhead) */
+		RTL_OSVERSIONINFOEXW osvi;
+		SYSTEM_INFO si;
+		DWORD computerNameSize;
+		HMODULE hNtdll;
+		RtlGetVersionFunc pRtlGetVersion;
 
 		/* Initialize cache fields as NULL by default */
 		os_cache.os_name_null = true;
@@ -77,113 +172,105 @@ void ReadOSInformations(Tuplestorestate *tupstore, TupleDesc tupdesc)
 		os_cache.architecture_null = true;
 		os_cache.boot_time_null = true;
 
-		/* Issue WMI query */
-		results = execute_query(query);
+		memset(os_cache.os_name, 0, sizeof(os_cache.os_name));
+		memset(os_cache.os_version, 0, sizeof(os_cache.os_version));
+		memset(os_cache.hostname, 0, sizeof(os_cache.hostname));
+		memset(os_cache.architecture, 0, sizeof(os_cache.architecture));
+		memset(os_cache.boot_time, 0, sizeof(os_cache.boot_time));
 
-		if (results != NULL)
+		/* Get OS friendly name from registry */
+		if (get_os_friendly_name(os_cache.os_name, sizeof(os_cache.os_name)))
 		{
-			IWbemClassObject *result = NULL;
-			ULONG returnedCount = 0;
-
-			/* Enumerate the retrieved objects */
-			while ((hres = results->lpVtbl->Next(results, WBEM_INFINITE, 1, &result, &returnedCount)) == S_OK)
-			{
-				VARIANT query_result;
-				int     wstr_length = 0;
-				size_t  charsConverted = 0;
-
-				/* Get OS Caption (name) */
-				hres = result->lpVtbl->Get(result, L"Caption", 0, &query_result, 0, 0);
-				if (SUCCEEDED(hres))
-				{
-					wstr_length = SysStringLen(query_result.bstrVal);
-					if (wstr_length > 0)
-					{
-						memset(os_cache.os_name, 0, sizeof(os_cache.os_name));
-						wcstombs_s(&charsConverted, os_cache.os_name, sizeof(os_cache.os_name),
-								   query_result.bstrVal, wstr_length);
-						os_cache.os_name_null = false;
-					}
-					VariantClear(&query_result);
-				}
-
-				/* Get OS Version */
-				hres = result->lpVtbl->Get(result, L"Version", 0, &query_result, 0, 0);
-				if (SUCCEEDED(hres))
-				{
-					wstr_length = SysStringLen(query_result.bstrVal);
-					if (wstr_length > 0)
-					{
-						memset(os_cache.os_version, 0, sizeof(os_cache.os_version));
-						wcstombs_s(&charsConverted, os_cache.os_version, sizeof(os_cache.os_version),
-								   query_result.bstrVal, wstr_length);
-						os_cache.os_version_null = false;
-					}
-					VariantClear(&query_result);
-				}
-
-				/* Get Computer Name (hostname) */
-				hres = result->lpVtbl->Get(result, L"CSName", 0, &query_result, 0, 0);
-				if (SUCCEEDED(hres))
-				{
-					wstr_length = SysStringLen(query_result.bstrVal);
-					if (wstr_length > 0)
-					{
-						memset(os_cache.hostname, 0, sizeof(os_cache.hostname));
-						wcstombs_s(&charsConverted, os_cache.hostname, sizeof(os_cache.hostname),
-								   query_result.bstrVal, wstr_length);
-						os_cache.hostname_null = false;
-					}
-					VariantClear(&query_result);
-				}
-
-				/* Get OS Architecture */
-				hres = result->lpVtbl->Get(result, L"OSArchitecture", 0, &query_result, 0, 0);
-				if (SUCCEEDED(hres))
-				{
-					wstr_length = SysStringLen(query_result.bstrVal);
-					if (wstr_length > 0)
-					{
-						memset(os_cache.architecture, 0, sizeof(os_cache.architecture));
-						wcstombs_s(&charsConverted, os_cache.architecture, sizeof(os_cache.architecture),
-								   query_result.bstrVal, wstr_length);
-						os_cache.architecture_null = false;
-					}
-					VariantClear(&query_result);
-				}
-
-				/* Get Last Boot Up Time */
-				hres = result->lpVtbl->Get(result, L"LastBootUpTime", 0, &query_result, 0, 0);
-				if (SUCCEEDED(hres))
-				{
-					wstr_length = SysStringLen(query_result.bstrVal);
-					if (wstr_length > 0)
-					{
-						memset(os_cache.boot_time, 0, sizeof(os_cache.boot_time));
-						wcstombs_s(&charsConverted, os_cache.boot_time, sizeof(os_cache.boot_time),
-								   query_result.bstrVal, wstr_length);
-						os_cache.boot_time_null = false;
-					}
-					VariantClear(&query_result);
-				}
-
-				/* Release the current result object */
-				result->lpVtbl->Release(result);
-			}
-
-			/* Release results set */
-			results->lpVtbl->Release(results);
-
-			/* Mark cache as initialized */
-			os_cache.initialized = true;
-			ereport(DEBUG1, (errmsg("[ReadOSInformations]: OS information cached for subsequent calls")));
+			os_cache.os_name_null = false;
 		}
 		else
 		{
-			ereport(DEBUG1, (errmsg("[ReadOSInformations]: Failed to get query result")));
+			ereport(DEBUG1, (errmsg("[ReadOSInformations]: Failed to get OS friendly name")));
 		}
 
-		SysFreeString(query);
+		/* Get OS version using RtlGetVersion (more reliable than GetVersionEx) */
+		hNtdll = GetModuleHandleA("ntdll.dll");
+		if (hNtdll != NULL)
+		{
+			pRtlGetVersion = (RtlGetVersionFunc)GetProcAddress(hNtdll, "RtlGetVersion");
+			if (pRtlGetVersion != NULL)
+			{
+				memset(&osvi, 0, sizeof(osvi));
+				osvi.dwOSVersionInfoSize = sizeof(osvi);
+
+				if (pRtlGetVersion((PRTL_OSVERSIONINFOW)&osvi) == 0)
+				{
+					/* Format as Major.Minor.Build (e.g., "10.0.19045") */
+					snprintf(os_cache.os_version, sizeof(os_cache.os_version),
+							 "%lu.%lu.%lu",
+							 osvi.dwMajorVersion,
+							 osvi.dwMinorVersion,
+							 osvi.dwBuildNumber);
+					os_cache.os_version_null = false;
+				}
+				else
+				{
+					ereport(DEBUG1, (errmsg("[ReadOSInformations]: RtlGetVersion failed")));
+				}
+			}
+		}
+
+		/* Get computer name (hostname) */
+		computerNameSize = sizeof(os_cache.hostname);
+		if (GetComputerNameExA(ComputerNameDnsHostname, os_cache.hostname, &computerNameSize))
+		{
+			os_cache.hostname_null = false;
+		}
+		else
+		{
+			/* Fallback to NetBIOS name if DNS hostname fails */
+			computerNameSize = sizeof(os_cache.hostname);
+			if (GetComputerNameA(os_cache.hostname, &computerNameSize))
+			{
+				os_cache.hostname_null = false;
+			}
+			else
+			{
+				ereport(DEBUG1, (errmsg("[ReadOSInformations]: Failed to get computer name")));
+			}
+		}
+
+		/* Get system architecture */
+		GetNativeSystemInfo(&si);
+		switch (si.wProcessorArchitecture)
+		{
+			case PROCESSOR_ARCHITECTURE_AMD64:
+				snprintf(os_cache.architecture, sizeof(os_cache.architecture), "64-bit");
+				os_cache.architecture_null = false;
+				break;
+			case PROCESSOR_ARCHITECTURE_INTEL:
+				snprintf(os_cache.architecture, sizeof(os_cache.architecture), "32-bit");
+				os_cache.architecture_null = false;
+				break;
+			case PROCESSOR_ARCHITECTURE_ARM:
+				snprintf(os_cache.architecture, sizeof(os_cache.architecture), "ARM");
+				os_cache.architecture_null = false;
+				break;
+			case PROCESSOR_ARCHITECTURE_ARM64:
+				snprintf(os_cache.architecture, sizeof(os_cache.architecture), "ARM64");
+				os_cache.architecture_null = false;
+				break;
+			default:
+				snprintf(os_cache.architecture, sizeof(os_cache.architecture), "Unknown");
+				os_cache.architecture_null = false;
+				break;
+		}
+
+		/* Get boot time using GetTickCount64 (system uptime in milliseconds) */
+		format_boot_time(GetTickCount64(), os_cache.boot_time, sizeof(os_cache.boot_time));
+		if (strlen(os_cache.boot_time) > 0)
+		{
+			os_cache.boot_time_null = false;
+		}
+
+		/* Mark cache as initialized */
+		os_cache.initialized = true;
+		ereport(DEBUG1, (errmsg("[ReadOSInformations]: OS information cached using native APIs")));
 	}
 
 	/* Use cached static data to populate values */
