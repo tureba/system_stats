@@ -169,14 +169,15 @@ void execute_init_query()
 
 	if (services != NULL)
 	{
-		BSTR query = SysAllocString(L"SELECT * FROM Win32_PerfFormattedData_PerfProc_Process");
+		/* Warm up Win32_OperatingSystem for pg_sys_os_info */
+		BSTR query = SysAllocString(L"SELECT * FROM Win32_OperatingSystem");
 
 		// issue a WMI query
 		hres = services->lpVtbl->ExecQuery(services, language, query, WBEM_FLAG_BIDIRECTIONAL, NULL, &results);
 		if (FAILED(hres))
-			ereport(DEBUG1, (errmsg("Failed to execute WQL query")));
+			ereport(DEBUG1, (errmsg("Failed to execute WQL warm-up query for Win32_OperatingSystem")));
 
-		/* Ignore the result as we are not intersted in */
+		/* Ignore the result as we are not interested in it */
 		if (results != NULL)
 			results->lpVtbl->Release(results);
 
